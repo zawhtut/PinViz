@@ -4,8 +4,8 @@ import math
 
 import drawsvg as draw
 
-from .layout import LayoutConfig, RoutedWire, create_bezier_path
-from .model import DEFAULT_COLORS, ComponentType, PinRole, Point
+from .layout import LayoutConfig, RoutedWire, create_bezier_path, create_orthogonal_path
+from .model import DEFAULT_COLORS, ComponentType, PinRole, Point, WireStyle
 from .render_constants import RENDER_CONSTANTS
 from .theme import ColorScheme
 
@@ -103,9 +103,16 @@ class WireRenderer:
 
         self._draw_wire_endpoints(dwg, wire)
 
+    def _build_path(self, points: list[Point], wire_style: WireStyle) -> str:
+        """Build SVG path data using the wire's routing style."""
+        if wire_style == WireStyle.ORTHOGONAL:
+            return create_orthogonal_path(points, self.layout_config.corner_radius)
+        return create_bezier_path(points, self.layout_config.corner_radius)
+
     def draw_wire_connection_segment(self, dwg: draw.Drawing, wire: RoutedWire) -> None:
         """Draw just the final straight segment that connects to the device pin."""
-        if len(wire.path_points) >= 5:
+        min_points = 3 if wire.wire_style == WireStyle.ORTHOGONAL else 5
+        if len(wire.path_points) >= min_points:
             # Draw the straight line from connection_point to pin
             connection_point = wire.path_points[-2]
             end_point = wire.path_points[-1]
@@ -231,15 +238,16 @@ class WireRenderer:
         """Draw a simple wire without components."""
         # Determine appropriate halo color for wire visibility
         halo_color = get_halo_color(wire.color)
+        min_points = 3 if wire.wire_style == WireStyle.ORTHOGONAL else 5
 
-        if draw_connection_segment or len(wire.path_points) < 5:
+        if draw_connection_segment or len(wire.path_points) < min_points:
             # Draw the full wire path
-            path_d = create_bezier_path(wire.path_points, self.layout_config.corner_radius)
+            path_d = self._build_path(wire.path_points, wire.wire_style)
             self._draw_wire_halo(dwg, path_d, halo_color)
             self._draw_wire_core(dwg, path_d, wire.color)
         else:
             # Draw only up to the connection point (skip the final straight segment)
-            path_d = create_bezier_path(wire.path_points[:-1], self.layout_config.corner_radius)
+            path_d = self._build_path(wire.path_points[:-1], wire.wire_style)
             self._draw_wire_halo(dwg, path_d, halo_color)
             self._draw_wire_core(dwg, path_d, wire.color)
 
@@ -281,7 +289,7 @@ class WireRenderer:
             # Determine appropriate halo color for wire visibility
             halo_color = get_halo_color(wire.color)
 
-            path_d = create_bezier_path(segment_points, self.layout_config.corner_radius)
+            path_d = self._build_path(segment_points, wire.wire_style)
             self._draw_wire_halo(dwg, path_d, halo_color)
             self._draw_wire_core(dwg, path_d, wire.color)
 

@@ -23,7 +23,7 @@ from .types import (
     RoutedWire,
     WireData,
 )
-from .utils import create_bezier_path
+from .utils import create_bezier_path, create_orthogonal_path
 
 __all__ = [
     # Main engine
@@ -40,4 +40,5 @@ __all__ = [
     "CanvasSizer",
     # Utilities
     "create_bezier_path",
+    "create_orthogonal_path",
 ]

@@ -4,6 +4,7 @@ import logging
 
 from ..constants import TABLE_LAYOUT
 from ..model import Diagram
+from ..render_constants import RENDER_CONSTANTS
 from .types import LayoutConfig, RoutedWire
 
 logger = logging.getLogger(__name__)
@@ -50,17 +51,19 @@ class CanvasSizer:
             Adds extra margin for the legend and GPIO reference diagram if enabled.
         """
         # Start with board dimensions
+        board_bottom = self.board_margin_top + diagram.board.height
         max_x = self.config.board_margin_left + diagram.board.width
-        max_y = self.board_margin_top + diagram.board.height
+        max_y = board_bottom
 
-        # Find rightmost device across all tiers
+        # Find rightmost/bottommost device across all tiers
         for device in diagram.devices:
             device_right = device.position.x + device.width
             device_bottom = device.position.y + device.height
             max_x = max(max_x, device_right)
             max_y = max(max_y, device_bottom)
 
-        # Check wire paths
+        # Check wire paths (account for half stroke width at extreme waypoints)
+        wire_half_stroke = RENDER_CONSTANTS.WIRE_MAIN_STROKE_WIDTH / 2.0
         for wire in routed_wires:
             for point in wire.path_points:
                 max_x = max(max_x, point.x)
@@ -69,6 +72,23 @@ class CanvasSizer:
         # Add uniform padding around all content
         canvas_width = max_x + self.config.canvas_padding
         canvas_height = max_y + self.config.canvas_padding
+
+        # Ensure external board name label below board never clips at bottom
+        if diagram.show_board_name:
+            board_label_bottom = (
+                board_bottom
+                + RENDER_CONSTANTS.BOARD_LABEL_Y_OFFSET
+                + RENDER_CONSTANTS.BOARD_LABEL_FONT_SIZE * 0.3
+            )
+            canvas_height = max(canvas_height, board_label_bottom + 15.0)
+
+        # Ensure bottommost wire stroke/halo is never clipped even with tiny padding
+        if routed_wires:
+            max_wire_y = max(
+                (pt.y for wire in routed_wires for pt in wire.path_points),
+                default=0.0,
+            )
+            canvas_height = max(canvas_height, max_wire_y + wire_half_stroke + 4.0)
 
         # Add extra space for device specifications table if needed
         # Table is positioned below the bottommost element (device or board)

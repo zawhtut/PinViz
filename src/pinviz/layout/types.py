@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from ..model import Connection, Device, Point
+from ..model import Connection, Device, Point, WireStyle
 
 
 @dataclass
@@ -34,10 +34,11 @@ class LayoutConfig:
         gpio_diagram_margin: Margin around GPIO reference diagram (default: 40.0)
         specs_table_top_margin: Margin above specs table from bottom element (default: 30.0)
         tier_spacing: Horizontal spacing between device tiers (default: 200.0)
+        grid_size: Grid spacing in SVG units for orthogonal routing (default: 10)
         min_canvas_width: Minimum canvas width (default: 400.0)
         min_canvas_height: Minimum canvas height (default: 300.0)
         max_canvas_width: Maximum canvas width (default: 5000.0)
-        max_canvas_height: Maximum canvas height (default: 3000.0)
+        max_canvas_height: Maximum canvas height (default: 50000.0)
         warn_connections: Threshold for connection count warning (default: 30)
         warn_devices: Threshold for device count warning (default: 20)
         max_connections: Hard limit for connection count, None = unlimited (default: None)
@@ -64,10 +65,11 @@ class LayoutConfig:
     gpio_diagram_margin: float = 40.0  # Margin around GPIO diagram
     specs_table_top_margin: float = 30.0  # Margin above specs table
     tier_spacing: float = 200.0  # Horizontal spacing between device tiers
+    grid_size: int = 10  # Grid spacing for orthogonal wire routing
     min_canvas_width: float = 400.0  # Minimum canvas width
     min_canvas_height: float = 300.0  # Minimum canvas height
     max_canvas_width: float = 5000.0  # Maximum canvas width
-    max_canvas_height: float = 3000.0  # Maximum canvas height
+    max_canvas_height: float = 50000.0  # Maximum canvas height
     # Complexity thresholds
     warn_connections: int = 30  # Warn if connections exceed this
     warn_devices: int = 20  # Warn if devices exceed this
@@ -167,6 +169,7 @@ class RoutedWire:
     color: str
     from_pin_pos: Point
     to_pin_pos: Point
+    wire_style: WireStyle = WireStyle.CURVED
 
 
 @dataclass

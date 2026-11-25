@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Self
 
 from .board_selection import AliasBoardSelectionStrategy, BoardSelectionStrategy
-from .model import Board, Connection, Device, Diagram, LayoutMode
+from .model import Board, Connection, Device, Diagram, LayoutMode, WireStyle
 from .theme import Theme
 
 
@@ -20,6 +20,8 @@ class DiagramOptions:
     show_board_name: bool = True
     theme: Theme = Theme.LIGHT
     layout: LayoutMode = LayoutMode.SCHEMATIC
+    wire_style: WireStyle = WireStyle.CURVED
+    grid_size: int = 10
 
 
 class DiagramBuilder:
@@ -75,6 +77,8 @@ class DiagramBuilder:
             show_board_name=self._options.show_board_name,
             theme=self._options.theme,
             layout_mode=self._options.layout,
+            wire_style=self._options.wire_style,
+            grid_size=self._options.grid_size,
         )
         self._reset()
         return diagram

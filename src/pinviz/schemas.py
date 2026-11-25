@@ -666,6 +666,8 @@ class DiagramConfigSchema(BaseModel):
         show_gpio_diagram: Whether to show GPIO pin diagram
         show_title: Whether to show the diagram title
         show_board_name: Whether to show board name label
+        wire_style: Diagram-level wire routing style ("curved" or "orthogonal")
+        grid_size: Grid spacing in SVG units for orthogonal routing
     """
 
     title: Annotated[str, Field(min_length=1, max_length=200, description="Diagram title")] = (
@@ -684,6 +686,10 @@ class DiagramConfigSchema(BaseModel):
     show_board_name: bool = True
     theme: Annotated[str, Field(description="Theme: light or dark")] = "light"
     layout: Literal["schematic", "breadboard"] = "schematic"
+    wire_style: Literal["curved", "orthogonal"] = "curved"
+    grid_size: Annotated[
+        int, Field(gt=0, description="Grid spacing in SVG units for orthogonal routing")
+    ] = 10
 
     model_config = ConfigDict(extra="forbid")
 

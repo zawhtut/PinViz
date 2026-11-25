@@ -3,6 +3,7 @@
 import logging
 import math
 import time
+from dataclasses import dataclass
 
 from ..model import DEFAULT_COLORS, Diagram, Point, WireStyle
 from .types import LayoutConfig, LayoutConstants, RoutedWire, WireData
@@ -549,6 +550,451 @@ class OverlapResolver:
         return adjustments
 
 
+@dataclass(frozen=True)
+class _Box:
+    """Axis-aligned bounding box for obstacle avoidance during routing."""
+
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    name: str
+
+
+def _snap_ceil(val: float, grid: float) -> float:
+    return math.ceil((val - 1e-9) / grid) * grid
+
+
+def _snap_floor(val: float, grid: float) -> float:
+    return math.floor((val + 1e-9) / grid) * grid
+
+
+def _intervals_overlap(a1: float, a2: float, b1: float, b2: float) -> bool:
+    lo_a, hi_a = (a1, a2) if a1 <= a2 else (a2, a1)
+    lo_b, hi_b = (b1, b2) if b1 <= b2 else (b2, b1)
+    return min(hi_a, hi_b) > max(lo_a, lo_b) + 1e-6
+
+
+def _h_seg_hits_box(x1: float, x2: float, y: float, box: _Box) -> bool:
+    lo_x, hi_x = (x1, x2) if x1 <= x2 else (x2, x1)
+    return min(hi_x, box.x2) > max(lo_x, box.x1) + 1e-6 and box.y1 - 1e-6 <= y <= box.y2 + 1e-6
+
+
+def _v_seg_hits_box(x: float, y1: float, y2: float, box: _Box) -> bool:
+    lo_y, hi_y = (y1, y2) if y1 <= y2 else (y2, y1)
+    return box.x1 - 1e-6 <= x <= box.x2 + 1e-6 and min(hi_y, box.y2) > max(lo_y, box.y1) + 1e-6
+
+
+def _dedupe_orthogonal_points(points: list[Point]) -> list[Point]:
+    """Remove duplicate and collinear intermediate points while keeping the final lead-in."""
+    if len(points) <= 2:
+        return points
+
+    body = points[:-1]
+    ext_end = points[-1]
+
+    deduped: list[Point] = []
+    for pt in body:
+        if not deduped or abs(pt.x - deduped[-1].x) > 1e-6 or abs(pt.y - deduped[-1].y) > 1e-6:
+            deduped.append(pt)
+
+    simplified: list[Point] = []
+    for pt in deduped:
+        simplified.append(pt)
+        while len(simplified) >= 3:
+            a, b, c = simplified[-3], simplified[-2], simplified[-1]
+            same_x = abs(a.x - b.x) < 1e-6 and abs(b.x - c.x) < 1e-6
+            same_y = abs(a.y - b.y) < 1e-6 and abs(b.y - c.y) < 1e-6
+            if same_x or same_y:
+                simplified.pop(-2)
+            else:
+                break
+
+    if abs(ext_end.x - simplified[-1].x) > 1e-6 or abs(ext_end.y - simplified[-1].y) > 1e-6:
+        simplified.append(ext_end)
+    return simplified
+
+
+class _OrthogonalRouter:
+    """Grid-aligned nested-L staircase router with cross-tier corridor avoidance."""
+
+    _TITLE_PAD = 18.0
+    _BOARD_LABEL_PAD = 24.0
+
+    def __init__(
+        self,
+        config: LayoutConfig,
+        constants: LayoutConstants,
+        board_margin_left: float,
+        board_margin_top: float,
+        grid_size: float,
+    ):
+        self.config = config
+        self.constants = constants
+        self.board_margin_left = board_margin_left
+        self.board_margin_top = board_margin_top
+        self.grid = max(1.0, grid_size)
+        self._used_v: dict[float, list[tuple[float, float]]] = {}
+        self._used_h: dict[float, list[tuple[float, float]]] = {}
+
+    def route(self, diagram: Diagram, wires: list[WireData]) -> list[RoutedWire]:
+        """Route a list of WireData orthogonally on grid-snapped tracks."""
+        board_box = _Box(
+            self.board_margin_left,
+            self.board_margin_top,
+            self.board_margin_left + diagram.board.width,
+            self.board_margin_top + diagram.board.height,
+            "__board__",
+        )
+        board_corridor_box = _Box(
+            board_box.x1,
+            board_box.y1,
+            board_box.x2,
+            board_box.y2 + (self._BOARD_LABEL_PAD if diagram.show_board_name else 0.0),
+            "__board__",
+        )
+
+        boxes: dict[str, _Box] = {"__board__": board_box}
+        corridor_boxes: list[_Box] = [board_corridor_box]
+        for dev in diagram.devices:
+            box = _Box(
+                dev.position.x,
+                dev.position.y,
+                dev.position.x + dev.width,
+                dev.position.y + dev.height,
+                dev.name,
+            )
+            boxes[dev.name] = box
+            corridor_boxes.append(
+                _Box(
+                    box.x1,
+                    max(0.0, box.y1 - self._TITLE_PAD),
+                    box.x2,
+                    box.y2,
+                    dev.name,
+                )
+            )
+
+        all_boxes = list(boxes.values())
+        path_gen = PathGenerator(self.constants)
+
+        # Group wires by (source_entity, source_side) for deterministic staircase fan-out
+        side_groups: dict[tuple[str, str], list[tuple[int, WireData]]] = {}
+        for idx, wire in enumerate(wires):
+            src_name = wire.source_device.name if wire.source_device is not None else "__board__"
+            src_is_right = wire.is_source_right_side if wire.source_device is not None else True
+            side = "right" if src_is_right else "left"
+            side_groups.setdefault((src_name, side), []).append((idx, wire))
+
+        routed_by_idx: dict[int, RoutedWire] = {}
+
+        def _group_sort_key(item: tuple[tuple[str, str], list[tuple[int, WireData]]]):
+            (name, side), _ = item
+            b = boxes[name]
+            return (0 if name == "__board__" else 1, b.x1, b.y1, side)
+
+        for (src_name, side), group in sorted(side_groups.items(), key=_group_sort_key):
+            src_box = boxes[src_name]
+            src_is_right = side == "right"
+            src_dir = 1.0 if src_is_right else -1.0
+            base_x = (
+                _snap_ceil(src_box.x2 + self.grid, self.grid)
+                if src_is_right
+                else _snap_floor(src_box.x1 - self.grid, self.grid)
+            )
+
+            up = [item for item in group if item[1].to_pos.y < item[1].from_pos.y - 1e-6]
+            dn = [item for item in group if item[1].to_pos.y > item[1].from_pos.y + 1e-6]
+            flat = [item for item in group if abs(item[1].to_pos.y - item[1].from_pos.y) <= 1e-6]
+
+            # Outermost pin gets step=1 (closest to box), innermost pin gets step=k (furthest)
+            up.sort(key=lambda item: (item[1].from_pos.y, item[1].to_pos.y))
+            dn.sort(key=lambda item: (-item[1].from_pos.y, -item[1].to_pos.y))
+            flat.sort(key=lambda item: abs(item[1].to_pos.x - item[1].from_pos.x))
+
+            ordered_with_steps: list[tuple[int, WireData, int]] = []
+            for idx_w, w in flat:
+                ordered_with_steps.append((idx_w, w, 1))
+            for step_idx, (idx_w, w) in enumerate(up, start=1):
+                ordered_with_steps.append((idx_w, w, step_idx))
+            for step_idx, (idx_w, w) in enumerate(dn, start=1):
+                ordered_with_steps.append((idx_w, w, step_idx))
+
+            for orig_idx, wire, step in ordered_with_steps:
+                dst_box = boxes[wire.device.name]
+                conn_pt, ext_end = path_gen._connection_points(
+                    wire.to_pos, wire.is_target_right_side
+                )
+                desired_x = base_x + src_dir * (step - 1) * self.grid
+
+                points = self._route_single_wire(
+                    diagram=diagram,
+                    wire=wire,
+                    src_box=src_box,
+                    dst_box=dst_box,
+                    src_is_right=src_is_right,
+                    desired_src_x=desired_x,
+                    conn_pt=conn_pt,
+                    ext_end=ext_end,
+                    all_boxes=all_boxes,
+                    corridor_boxes=corridor_boxes,
+                )
+
+                routed_by_idx[orig_idx] = RoutedWire(
+                    connection=wire.connection,
+                    path_points=points,
+                    color=wire.color,
+                    from_pin_pos=wire.from_pos,
+                    to_pin_pos=wire.to_pos,
+                    wire_style=WireStyle.ORTHOGONAL,
+                )
+
+        return [routed_by_idx[i] for i in range(len(wires))]
+
+    def _v_track_free(self, x: float, y1: float, y2: float, boxes: list[_Box]) -> bool:
+        for box in boxes:
+            if _v_seg_hits_box(x, y1, y2, box):
+                return False
+        for seg_y1, seg_y2 in self._used_v.get(round(x, 6), ()):
+            if _intervals_overlap(y1, y2, seg_y1, seg_y2):
+                return False
+        return True
+
+    def _h_track_free(self, y: float, x1: float, x2: float, boxes: list[_Box]) -> bool:
+        for box in boxes:
+            if _h_seg_hits_box(x1, x2, y, box):
+                return False
+        for seg_x1, seg_x2 in self._used_h.get(round(y, 6), ()):
+            if _intervals_overlap(x1, x2, seg_x1, seg_x2):
+                return False
+        return True
+
+    def _reserve_v(self, x: float, y1: float, y2: float) -> None:
+        if abs(y2 - y1) > 1e-6:
+            self._used_v.setdefault(round(x, 6), []).append((min(y1, y2), max(y1, y2)))
+
+    def _reserve_h(self, y: float, x1: float, x2: float) -> None:
+        if abs(x2 - x1) > 1e-6:
+            self._used_h.setdefault(round(y, 6), []).append((min(x1, x2), max(x1, x2)))
+
+    def _stubs_clear(
+        self,
+        from_pos: Point,
+        x_track: float,
+        conn_pt: Point,
+        to_y: float,
+        src_box: _Box,
+        dst_box: _Box,
+        corridor_boxes: list[_Box],
+    ) -> bool:
+        src_edge_x = src_box.x2 if x_track > src_box.x2 else src_box.x1
+        dst_edge_x = dst_box.x2 if conn_pt.x > dst_box.x2 else dst_box.x1
+        for box in corridor_boxes:
+            if box.name != src_box.name and _h_seg_hits_box(src_edge_x, x_track, from_pos.y, box):
+                return False
+            if box.name != dst_box.name and _h_seg_hits_box(x_track, dst_edge_x, to_y, box):
+                return False
+        return True
+
+    def _find_gutter_x(
+        self,
+        start_x: float,
+        step_dir: float,
+        y1: float,
+        y2: float,
+        all_boxes: list[_Box],
+        max_steps: int = 80,
+    ) -> float:
+        for i in range(max_steps):
+            cand = start_x + i * step_dir * self.grid
+            if self._v_track_free(cand, y1, y2, all_boxes):
+                return cand
+        return start_x
+
+    def _find_corridor_y(
+        self,
+        diagram: Diagram,
+        from_y: float,
+        to_y: float,
+        min_x: float,
+        max_x: float,
+        corridor_boxes: list[_Box],
+    ) -> float:
+        blocking = [b for b in corridor_boxes if b.x1 <= max_x + 1e-6 and b.x2 >= min_x - 1e-6]
+        if not blocking:
+            for cand in (to_y, from_y):
+                snapped = _snap_ceil(cand, self.grid)
+                if self._h_track_free(snapped, min_x, max_x, corridor_boxes):
+                    return snapped
+
+        title_min_y = (
+            _snap_ceil(
+                self.config.board_margin_top_base
+                + self.config.title_height
+                + self.config.title_margin,
+                self.grid,
+            )
+            if diagram.show_title
+            else self.grid
+        )
+
+        candidates: list[float] = []
+
+        # Top corridor above all blocking boxes
+        if blocking:
+            top_y = _snap_floor(min(b.y1 for b in blocking) - self.grid, self.grid)
+            while top_y >= title_min_y and not self._h_track_free(
+                top_y, min_x, max_x, corridor_boxes
+            ):
+                top_y -= self.grid
+            if top_y >= title_min_y:
+                candidates.append(top_y)
+
+            # Bottom corridor below all blocking boxes
+            bot_y = _snap_ceil(max(b.y2 for b in blocking) + self.grid, self.grid)
+            while not self._h_track_free(bot_y, min_x, max_x, corridor_boxes):
+                bot_y += self.grid
+            candidates.append(bot_y)
+
+            # Mid-tier gap corridors between vertically separated blocking boxes
+            intervals = sorted((b.y1, b.y2) for b in blocking)
+            merged: list[list[float]] = []
+            for y1, y2 in intervals:
+                if not merged or y1 > merged[-1][1]:
+                    merged.append([y1, y2])
+                else:
+                    merged[-1][1] = max(merged[-1][1], y2)
+
+            for idx in range(len(merged) - 1):
+                gap_top = merged[idx][1]
+                gap_bot = merged[idx + 1][0]
+                if gap_bot - gap_top >= 2 * self.grid:
+                    cy = _snap_ceil(gap_top + self.grid, self.grid)
+                    max_gap_y = _snap_floor(gap_bot - self.grid, self.grid)
+                    while cy <= max_gap_y:
+                        if cy >= title_min_y and self._h_track_free(
+                            cy, min_x, max_x, corridor_boxes
+                        ):
+                            candidates.append(cy)
+                            break
+                        cy += self.grid
+        else:
+            bot_y = _snap_ceil(max(from_y, to_y), self.grid)
+            while not self._h_track_free(bot_y, min_x, max_x, corridor_boxes):
+                bot_y += self.grid
+            candidates.append(bot_y)
+
+        return min(candidates, key=lambda cy: abs(from_y - cy) + abs(cy - to_y))
+
+    def _route_single_wire(
+        self,
+        diagram: Diagram,
+        wire: WireData,
+        src_box: _Box,
+        dst_box: _Box,
+        src_is_right: bool,
+        desired_src_x: float,
+        conn_pt: Point,
+        ext_end: Point,
+        all_boxes: list[_Box],
+        corridor_boxes: list[_Box],
+    ) -> list[Point]:
+        from_pos = wire.from_pos
+        to_pos = wire.to_pos
+        src_dir = 1.0 if src_is_right else -1.0
+        dst_entry_right = wire.is_target_right_side
+
+        # 1. Straight horizontal wire when pins align and exit/entry face each other cleanly
+        if abs(to_pos.y - from_pos.y) <= 1e-6:
+            facing_clean = (
+                src_is_right and not dst_entry_right and src_box.x2 <= conn_pt.x + 1e-6
+            ) or (not src_is_right and dst_entry_right and src_box.x1 >= conn_pt.x - 1e-6)
+            if facing_clean:
+                src_edge_x = src_box.x2 if src_is_right else src_box.x1
+                dst_edge_x = dst_box.x2 if dst_entry_right else dst_box.x1
+                other_boxes = [
+                    b for b in corridor_boxes if b.name not in (src_box.name, dst_box.name)
+                ]
+                if self._h_track_free(from_pos.y, src_edge_x, dst_edge_x, other_boxes):
+                    self._reserve_h(from_pos.y, src_edge_x, dst_edge_x)
+                    return _dedupe_orthogonal_points([from_pos, conn_pt, ext_end])
+
+        # 2. Try 1-track direct Z/L route in the open gutter between source and target
+        def _within_target_entry_bound(x_val: float) -> bool:
+            if dst_entry_right:
+                return x_val >= conn_pt.x + self.grid - 1e-6
+            return x_val <= conn_pt.x - self.grid + 1e-6
+
+        def _within_src_exit_bound(x_val: float) -> bool:
+            if src_is_right:
+                return x_val >= src_box.x2 + self.grid - 1e-6
+            return x_val <= src_box.x1 - self.grid + 1e-6
+
+        if _within_src_exit_bound(desired_src_x) and _within_target_entry_bound(desired_src_x):
+            for m in range(40):
+                cand_x = desired_src_x + m * src_dir * self.grid
+                if not _within_target_entry_bound(cand_x):
+                    break
+                if self._v_track_free(
+                    cand_x, from_pos.y, to_pos.y, all_boxes
+                ) and self._stubs_clear(
+                    from_pos, cand_x, conn_pt, to_pos.y, src_box, dst_box, corridor_boxes
+                ):
+                    self._reserve_v(cand_x, from_pos.y, to_pos.y)
+                    return _dedupe_orthogonal_points(
+                        [
+                            from_pos,
+                            Point(cand_x, from_pos.y),
+                            Point(cand_x, to_pos.y),
+                            conn_pt,
+                            ext_end,
+                        ]
+                    )
+
+        # 3. Cross-tier / reverse-direction / blocked gutter: route via top/bottom/gap corridor
+        src_gutter_x = self._find_gutter_x(
+            desired_src_x, src_dir, from_pos.y, from_pos.y, all_boxes
+        )
+        dst_step_dir = 1.0 if dst_entry_right else -1.0
+        dst_base_x = (
+            _snap_ceil(max(dst_box.x2 + self.grid, conn_pt.x + self.grid), self.grid)
+            if dst_entry_right
+            else _snap_floor(min(dst_box.x1 - self.grid, conn_pt.x - self.grid), self.grid)
+        )
+        dst_gutter_x = self._find_gutter_x(dst_base_x, dst_step_dir, to_pos.y, to_pos.y, all_boxes)
+
+        min_x = min(src_gutter_x, dst_gutter_x)
+        max_x = max(src_gutter_x, dst_gutter_x)
+        corridor_y = self._find_corridor_y(
+            diagram, from_pos.y, to_pos.y, min_x, max_x, corridor_boxes
+        )
+
+        # Ensure vertical gutter segments along [from_y..corridor_y] and [corridor_y..to_y]
+        # remain clear of boxes and existing vertical tracks.
+        src_gutter_x = self._find_gutter_x(src_gutter_x, src_dir, from_pos.y, corridor_y, all_boxes)
+        dst_gutter_x = self._find_gutter_x(
+            dst_gutter_x, dst_step_dir, corridor_y, to_pos.y, all_boxes
+        )
+
+        self._reserve_v(src_gutter_x, from_pos.y, corridor_y)
+        self._reserve_h(
+            corridor_y, min(src_gutter_x, dst_gutter_x), max(src_gutter_x, dst_gutter_x)
+        )
+        self._reserve_v(dst_gutter_x, corridor_y, to_pos.y)
+
+        return _dedupe_orthogonal_points(
+            [
+                from_pos,
+                Point(src_gutter_x, from_pos.y),
+                Point(src_gutter_x, corridor_y),
+                Point(dst_gutter_x, corridor_y),
+                Point(dst_gutter_x, to_pos.y),
+                conn_pt,
+                ext_end,
+            ]
+        )
+
+
 class WireRouter:
     """
     Routes wires between board pins and device pins.
@@ -558,6 +1004,7 @@ class WireRouter:
     - RailAssigner: assigns routing rails to prevent crossings
     - OverlapResolver: detects and resolves wire conflicts
     - PathGenerator: generates Bezier curve paths
+    - _OrthogonalRouter: routes grid-aligned staircase orthogonal wires
     """
 
     def __init__(self, config: LayoutConfig, board_margin_left: float, board_margin_top: float):
@@ -567,17 +1014,47 @@ class WireRouter:
         self.board_margin_top = board_margin_top
 
     def route_wires(self, diagram: Diagram) -> list[RoutedWire]:
-        """Route all wires using device-based routing lanes."""
+        """Route all wires using the diagram's wire style (or per-connection overrides)."""
         collector = WireDataCollector(self.board_margin_left, self.board_margin_top, self.constants)
         wire_data = collector.collect(diagram)
-        wire_data.sort(key=lambda w: (w.from_pos.y, w.device.position.y, w.to_pos.y))
-        y_groups = collector.group_by_position(wire_data)
 
-        assigner = RailAssigner(self.config, self.constants, self.board_margin_left)
-        initial_wires = assigner.assign(wire_data, diagram.board.width, y_groups)
+        grid_size = float(diagram.grid_size if diagram.grid_size > 0 else self.config.grid_size)
+        if diagram.wire_style == WireStyle.ORTHOGONAL:
+            ortho_router = _OrthogonalRouter(
+                self.config,
+                self.constants,
+                self.board_margin_left,
+                self.board_margin_top,
+                grid_size,
+            )
+            return ortho_router.route(diagram, wire_data)
 
-        path_gen = PathGenerator(self.constants)
-        resolver = OverlapResolver(self.config, self.constants)
-        adjustments = resolver.resolve(initial_wires, path_gen)
+        curved_data = [w for w in wire_data if w.connection.style != WireStyle.ORTHOGONAL]
+        ortho_data = [w for w in wire_data if w.connection.style == WireStyle.ORTHOGONAL]
 
-        return path_gen.generate(initial_wires, adjustments)
+        routed_curved: list[RoutedWire] = []
+        if curved_data:
+            curved_data.sort(key=lambda w: (w.from_pos.y, w.device.position.y, w.to_pos.y))
+            y_groups = collector.group_by_position(curved_data)
+
+            assigner = RailAssigner(self.config, self.constants, self.board_margin_left)
+            initial_wires = assigner.assign(curved_data, diagram.board.width, y_groups)
+
+            path_gen = PathGenerator(self.constants)
+            resolver = OverlapResolver(self.config, self.constants)
+            adjustments = resolver.resolve(initial_wires, path_gen)
+
+            routed_curved = path_gen.generate(initial_wires, adjustments)
+
+        routed_ortho: list[RoutedWire] = []
+        if ortho_data:
+            ortho_router = _OrthogonalRouter(
+                self.config,
+                self.constants,
+                self.board_margin_left,
+                self.board_margin_top,
+                grid_size,
+            )
+            routed_ortho = ortho_router.route(diagram, ortho_data)
+
+        return routed_curved + routed_ortho

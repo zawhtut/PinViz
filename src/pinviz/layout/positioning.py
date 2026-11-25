@@ -5,6 +5,11 @@ from ..constants import LAYOUT_ADJUSTMENTS
 from ..model import Device, Diagram, Point
 from .types import LayoutConfig
 
+# External device title sits 5px above the box with up to 12px font height
+_EXTERNAL_TITLE_HEIGHT = 17.0
+_MIN_INTER_MODULE_GAP = 3.0
+_MIN_VERTICAL_SPACING_FLOOR = _EXTERNAL_TITLE_HEIGHT + _MIN_INTER_MODULE_GAP
+
 
 class DevicePositioner:
     """
@@ -247,13 +252,19 @@ class DevicePositioner:
             device.position = Point(device.position.x, adjusted_y)
             current_y = adjusted_y + device.height + min_spacing
 
+    def _minimum_vertical_spacing(self) -> float:
+        """Return vertical spacing floored to protect external top title labels."""
+        return max(self.config.device_spacing_vertical, _MIN_VERTICAL_SPACING_FLOOR)
+
     def _position_evenly_distributed(
         self,
         device_targets: list[tuple[Device, float]],
         min_y: float,
         max_y: float,
+        min_spacing: float | None = None,
     ) -> None:
         """Distribute devices evenly when space is limited."""
+        floor_spacing = min_spacing if min_spacing is not None else self._minimum_vertical_spacing()
         if len(device_targets) == 1:
             # Single device - center vertically
             device, _ = device_targets[0]
@@ -266,14 +277,14 @@ class DevicePositioner:
             available_height = max_y - min_y
             num_gaps = len(device_targets) - 1
 
-            # Calculate spacing
+            # Calculate spacing, never collapsing below external title label clearance
             if num_gaps > 0:
                 if total_device_height <= available_height:
-                    # Enough space - distribute evenly
-                    spacing = (available_height - total_device_height) / num_gaps
+                    spacing = max(
+                        floor_spacing, (available_height - total_device_height) / num_gaps
+                    )
                 else:
-                    # Not enough space - use minimum spacing and extend beyond max_y
-                    spacing = self.config.device_spacing_vertical
+                    spacing = floor_spacing
             else:
                 spacing = 0
 
@@ -317,7 +328,7 @@ class DevicePositioner:
         # Step 4: Calculate space requirements
         total_device_height = sum(d.height for d, _ in device_targets)
         num_gaps = len(device_targets) - 1
-        min_spacing = self.config.device_spacing_vertical
+        min_spacing = self._minimum_vertical_spacing()
         total_min_spacing = num_gaps * min_spacing if num_gaps > 0 else 0
         total_height_needed = total_device_height + total_min_spacing
 
@@ -350,4 +361,6 @@ class DevicePositioner:
             self._position_with_target_y(device_targets, min_device_y, max_device_y, min_spacing)
         else:
             # Limited space - even distribution
-            self._position_evenly_distributed(device_targets, min_device_y, max_device_y)
+            self._position_evenly_distributed(
+                device_targets, min_device_y, max_device_y, min_spacing
+            )

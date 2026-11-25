@@ -729,3 +729,5 @@ class Diagram:
     canvas_width: float = 800.0
     canvas_height: float = 600.0
     layout_mode: LayoutMode = LayoutMode.SCHEMATIC
+    wire_style: WireStyle = WireStyle.CURVED
+    grid_size: int = 10

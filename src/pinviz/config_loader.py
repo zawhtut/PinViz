@@ -24,6 +24,7 @@ from .model import (
     LayoutMode,
     PinRole,
     Point,
+    WireStyle,
 )
 from .pin_assignment import PinAssigner
 from .schemas import ConnectionSchema, validate_config
@@ -262,6 +263,8 @@ class ConfigLoader:
             show_board_name=validated_config.show_board_name,
             theme=theme,
             layout=LayoutMode(validated_config.layout),
+            wire_style=WireStyle(validated_config.wire_style),
+            grid_size=validated_config.grid_size,
         )
         diagram = (
             DiagramBuilder(self._board_selection_strategy)
